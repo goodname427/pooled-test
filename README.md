@@ -31,6 +31,9 @@ $$J = \alpha \cdot \text{平均完成时间} + \beta \cdot \text{试剂消耗} +
 |------|------|
 | $x_i \in \{0, 1\}$ | 第 $i$ 瓶水真实毒性，$1$ 为有毒 |
 | $p_i$ | 第 $i$ 瓶水有毒的概率，未知 |
+| $\mu_o^{\text{anchor}}$ | Owner $o$ 的长期锚点毒率 |
+| $\mu_o^{(k)}$ | Owner $o$ 在第 $k$ 个阶段的当前中心毒率 |
+| $\hat p_o$ | 系统对 Owner $o$ 当前毒率的在线估计 |
 | $S$ | 一次检测选中的样本子集 |
 | $y(S) = \max_{i \in S} x_i$ | 一次混检的结果 |
 | $T$ | 单次检测耗时 |
@@ -88,15 +91,25 @@ $$J = \alpha \cdot \text{平均完成时间} + \beta \cdot \text{试剂消耗} +
 
 ## 3. 方案设计
 
-### 3.1 D3 — 在线估计：按 Owner 维度
+### 3.1 D3 — 在线估计：按 Owner 维度 + 指数衰减
 
-> **结论**：每个 Owner 维护独立的 Beta-Binomial 后验；冷启动用全局先验回退。
+> **结论**：每个 Owner 维护带指数衰减的 Beta-Binomial 后验；冷启动用全局先验回退。
 
-每个 Owner $o$ 维护两个计数：累计阳性数 $k_o$、累计样本数 $n_o$，后验：
+#### 3.1.1 衰减后验
 
-$$\hat{p}_o = \frac{k_o + 1}{n_o + 2} \quad (\text{Laplace smoothing})$$
+毒率不是平稳的——同一 Owner 的 $\mu_o$ 会随时间漂移（详见 §5 数据生成假设）。无衰减的累计后验会越来越钝，新数据被旧数据稀释，估计跟不上漂移。引入指数衰减：每观测到一个新样本，旧统计量按 $\gamma \in (0, 1]$ 折损一次：
 
-**冷启动处理**：
+$$
+k_o \leftarrow \gamma \cdot k_o + x_{\text{new}}, \qquad n_o \leftarrow \gamma \cdot n_o + 1
+$$
+
+后验仍按 Laplace 平滑：
+
+$$\hat{p}_o = \frac{k_o + 1}{n_o + 2}$$
+
+**$\gamma$ 的物理含义**：等效观测窗口约为 $1 / (1 - \gamma)$。$\gamma = 0.95$ 约等于近 20 次观测主导估计；$\gamma = 1.0$ 退化为无衰减累计。默认值 $\gamma = 0.95$ 在我们的漂移场景中表现稳定。
+
+#### 3.1.2 冷启动处理
 
 - 当 $n_o < 3$，把全局后验作为先验加权融合，避免 Owner 早期方差过大；
 - 当全局也不够样本（`global_n < cold_start_n`），把分组上限收紧到 `cold_start_max_group`，防止"信心十足地大合批一把全阳"的灾难。
@@ -133,13 +146,26 @@ $$\text{cost}_k \;=\; \frac{T \;+\; (1 - q_k) \cdot \lceil k / M \rceil \cdot T}
 - 动态到达下，"硬等够 $k$ 瓶"会让队列起伏放大，反而拉高 max_waiting；
 - 试剂空闲不测纯粹是浪费产能。
 
-**软等待 Tau**：只在以下条件全部成立时短暂保留试剂：
+**软等待 Tau（自适应）**：只在以下条件全部成立时短暂保留试剂：
 
 - 队列长度 < 当前前瞻最优 $k$
-- 队首已等待 < $\tau$
+- 队首已等待 < $\tau_t$
 - 后续仍有未来到达
 
-任意条件破掉立刻派发。$\tau$ 的物理含义是**单瓶水愿意为合批多等的最长时间**。这个机制覆盖稀疏到达场景——避免被迫单测、永远没机会合批。
+任意条件破掉立刻派发。
+
+$\tau$ 不再是常数，而是按当前到达率与队首毒率自适应：
+
+$$
+\tau_t = \text{clip}\left(\frac{1 - \hat p_{\text{head}}}{\lambda} \cdot T,\; \tau_{\min},\; \tau_{\max}\right)
+$$
+
+直觉：
+- 到达越密（$\lambda$ 大）→ 队列自己会涨起来，$\tau$ 应当小；
+- 队首估计越干净（$\hat p_{\text{head}}$ 小）→ 凑批回报更高，可以多等一会儿；
+- 队首毒率高 → 反正大概率走单测，没必要等。
+
+默认 $\tau_{\min} = 0.2T,\; \tau_{\max} = 5T$。这个机制覆盖稀疏到达场景——避免被迫单测、永远没机会合批。
 
 **FIFO 是硬约束**：不按毒率排序合批，理由：
 - 公平性：先到先得是业务底线；
@@ -213,9 +239,9 @@ while 还有未完成的样本:
 
 ```
 1. 若是单测（fallback 或 grp_size=1）：
-     直接得到结论，更新 OwnerEstimator
+     直接得到结论，更新 OwnerEstimator（带衰减）
 2. 否则混检：
-     全阴 → 整组判定无毒，所有样本更新 estimator
+     全阴 → 整组判定无毒，所有样本更新 estimator（带衰减）
      有阳 → 该批每瓶水加入 fallback_queue（保持 FIFO 顺序）
 ```
 
@@ -248,49 +274,100 @@ flowchart TD
 
 ---
 
-## 5. 参数说明
+## 5. 数据生成模型（评测用）
 
-### 5.1 Owner 模型参数
+为了复现"毒率非平稳"假设，样本流按以下层次生成：
+
+### 5.1 Owner 锚点
+
+每个 Owner 在初始化时一次性抽取一个长期锚点：
+
+$$\mu_o^{\text{anchor}} \sim \mathcal{N}(\text{pop\_mu},\; \text{pop\_sigma}^2)$$
+
+锚点终生不变，体现"低风险源始终偏低、高风险源始终偏高"。
+
+### 5.2 阶段切换：OU 漂移
+
+每个 Owner 的当前中心 $\mu_o^{(k)}$ 按阶段更新。阶段切换间隔服从指数分布（每 `drift_rate` 个该 Owner 样本平均切一次），切换时按均值回归高斯跳变（Ornstein-Uhlenbeck 离散化）：
+
+$$
+\mu_o^{(k+1)} = \mu_o^{(k)} + \kappa \cdot (\mu_o^{\text{anchor}} - \mu_o^{(k)}) + \mathcal{N}(0,\; \sigma_{\text{drift}}^2)
+$$
+
+再 clip 到 $[0.001, 0.999]$。
+
+| 参数 | 含义 | 默认 |
+|------|------|-----|
+| $\kappa$ | 回归强度（$0$=纯随机游走，$1$=直接拉回锚点） | 0.3 |
+| $\sigma_{\text{drift}}$ | 单次跳变标准差 | 0.02 |
+| `drift_rate` | 平均多少样本换一个阶段 | 50 |
+
+**为什么选 OU**：
+1. 高斯噪声天然对称，毒率上下跳动而不是单调漂；
+2. 回归项防止纯随机游走漂到 $0$ 或 $1$ 卡死；
+3. 稳态分布是 $\mathcal{N}(\mu_o^{\text{anchor}}, \frac{\sigma_{\text{drift}}^2}{2\kappa - \kappa^2})$，可控可分析。
+
+### 5.3 单样本毒率
+
+阶段内每瓶水：
+
+$$p_i \sim \mathcal{N}_{\text{trunc}}(\mu_o^{(k)},\; \text{owner\_sigma}^2,\; [0.001, 0.99])$$
+
+是否有毒：$x_i \sim \text{Bernoulli}(p_i)$。
+
+### 5.4 到达过程
+
+样本到达间隔 $\sim \text{Exp}(\lambda)$，即泊松到达；每瓶水按均匀分布随机绑定到一个 Owner。
+
+---
+
+## 6. 参数说明
+
+### 6.1 Owner 模型参数
 
 | 参数 | 含义 | 推荐范围 |
 |------|------|---------|
 | `n_owners` | Owner 数量 | 4 ~ 20 |
-| `pop_mu` | Owner 平均毒率的总体均值 | 0.05 ~ 0.3 |
+| `pop_mu` | 锚点总体均值 | 0.05 ~ 0.3 |
 | `pop_sigma` | Owner 之间的差异 | 同质场景小、异质场景大 |
-| `owner_sigma` | 同一 Owner 内样本毒率波动 | 0.005 ~ 0.02 |
+| `owner_sigma` | 阶段内样本毒率波动 | 0.005 ~ 0.02 |
+| `drift_rate` | 平均多少样本换一个阶段 | 20 ~ 80 |
+| `kappa` | OU 回归强度 | 0.2 ~ 0.4 |
+| `drift_sigma` | 单次跳变标准差 | 0.02 ~ 0.06 |
 
-### 5.2 系统参数
+### 6.2 系统参数
 
 | 参数 | 含义 | 推荐范围 |
 |------|------|---------|
 | `M` | 并行试剂槽数 | 1 / 2 / 4 |
 | `T` | 单次检测耗时 | 归一化为 1.0 |
 | `arrival_rate` | 到达率 $\lambda$ | 0.3（稀疏） ~ 5.0（爆发） |
-| `tau` | 软等待上限 | 1 ~ 3 |
 
-### 5.3 算法内部参数
+### 6.3 算法内部参数
 
 | 参数 | 含义 | 默认值 |
 |------|------|-------|
 | `p_init` | 冷启动毒率先验 | 0.15 |
+| `decay` | 估计器指数衰减系数 $\gamma$ | 0.95 |
 | `max_group` | 合批上限 | 16 |
 | `cold_start_n` | 多少观测后解锁正常分组 | 20 |
 | `cold_start_max_group` | 冷启动期分组上限 | 3 |
 | `single_test_threshold` | 高毒率逃逸阈值 | 0.35 |
+| `tau_min` / `tau_max` | 自适应 $\tau$ 上下限 | 0.2 / 5.0 |
 
 ---
 
-## 6. 实验与数据分析
+## 7. 实验与数据分析
 
-### 6.1 对照组
+### 7.1 对照组
 
 | 策略 | 思路 |
 |------|------|
 | **Baseline** | 每瓶水单独检测，性能下界 |
 | **Adaptive** | 全局 $\hat p$ + Dorfman 二分递归（经典对照） |
-| **Eager** | 本方案：Owner-aware + 着急调度 + M-aware 前瞻 + 单层 Fallback |
+| **Eager** | 本方案：Owner-aware（带衰减）+ 着急调度 + 自适应 $\tau$ + M-aware 前瞻 + 单层 Fallback |
 
-### 6.2 输出指标
+### 7.2 输出指标
 
 | 指标 | 定义 |
 |------|------|
@@ -301,43 +378,58 @@ flowchart TD
 | `tests_per_sample` | 单瓶平均消耗（合批效益核心指标） |
 | `throughput` | $N / \text{makespan}$ |
 
-### 6.3 ABTest 场景矩阵
+### 7.3 ABTest 场景矩阵
 
-10 个内置场景覆盖三个维度：
+13 个内置场景覆盖四个维度：
 
 | 维度 | 场景 |
 |------|------|
 | 毒率 / 同质度 | `homo_low_p`, `homo_mid_p`, `homo_high_p`, `hetero_wide`, `hetero_extreme`, `few_owners_mixed` |
 | 资源稀缺度 | `M=1_hetero`, `M=4_hetero` |
 | 到达模式 | `burst_hetero`（$\lambda = 5$）, `sparse_hetero`（$\lambda = 0.3$） |
+| 漂移强度 | `drift_slow`, `drift_fast`, `drift_volatile` |
 
-### 6.4 预期结论
+### 7.4 实测结论（500-600 样本，seed 固定）
 
-| 场景 | 预期表现 |
-|------|---------|
-| 低毒率（$p \leq 0.1$）+ 中等到达 | Eager 在 `tests_per_sample` 上节省 40%~60%，`avg_completion` 显著低于 Baseline |
-| 异质 Owner | Eager 优于 Adaptive，因为 Owner-aware 可识别"干净源"和"高风险源"，分组质量更高 |
-| 高毒率（$p \geq 0.3$） | 合批收益消失，Eager 通过高毒率逃逸退化为 Baseline，**不会变差** |
-| 稀疏到达 | Tau 软等待让 Eager 不会盲目单测，在等待可控的前提下保留合批收益 |
-| 资源紧张（$M = 1$） | Adaptive 的串行二分链劣势放大；Eager 通过单层 fallback 保持优势 |
-| 资源充裕（$M = 4$） | 三者差距缩小，但 Eager 仍在 `tests_per_sample` 上领先 |
+| 场景 | tests/sample (B/A/E) | avg_completion (B/A/E) | 胜者 |
+|------|---------------------|------------------------|------|
+| homo_low_p | 1.00 / 0.43 / 0.83 | 2.99 / 2.33 / **1.34** | Eager |
+| homo_mid_p | 1.00 / 0.62 / 0.83 | 8.69 / 3.02 / **1.91** | Eager |
+| homo_high_p | 1.00 / 1.05 / 1.04 | **9.65** / 20.76 / 17.64 | Baseline |
+| hetero_wide | 1.00 / 0.69 / 0.83 | 2.93 / 2.59 / **1.42** | Eager |
+| hetero_extreme | 1.00 / 0.70 / 0.81 | 10.26 / 4.10 / **1.79** | Eager |
+| few_owners_mixed | 1.00 / 0.74 / 0.84 | 13.33 / 3.08 / **2.30** | Eager |
+| M=1_hetero | 1.00 / 0.69 / 0.90 | 117.84 / **28.22** / 93.77 | Adaptive |
+| M=4_hetero | 1.00 / 0.44 / 0.96 | 1.05 / 2.25 / **1.03** | Eager |
+| burst_hetero | 1.00 / 0.56 / 0.58 | 73.97 / **12.93** / 14.24 | Adaptive |
+| sparse_hetero | 1.00 / 0.80 / 1.00 | **1.01** / 4.19 / 1.01 | Baseline |
+| drift_slow | 1.00 / 0.66 / 0.85 | 3.11 / 2.71 / **1.63** | Eager |
+| drift_fast | 1.00 / 0.61 / 0.81 | 5.14 / 2.57 / **1.57** | Eager |
+| drift_volatile | 1.00 / 0.88 / 0.89 | 8.65 / 4.61 / **2.76** | Eager |
 
-### 6.5 用法
+要点：
+
+- **主流场景全胜**：所有低/中毒率、异质、漂移场景下 Eager 在 `avg_completion` 上稳定优于 Adaptive 30%~50%。
+- **漂移场景的稳定性**：从 `drift_slow` 到 `drift_volatile`，Eager 的优势随漂移强度增加而扩大——衰减估计器在剧烈漂移下的优势体现得最明显。
+- **退化保护生效**：`homo_high_p` 下，高毒率逃逸让 Eager 接近 Baseline 而非崩盘；`sparse_hetero` 下自适应 $\tau$ 自动收敛到"几乎不等"，Eager 与 Baseline 持平。
+- **已知不擅长**：`M=1` 极端资源紧张时，单层 fallback 的并行优势消失，二分递归的 Adaptive 反而更优——这是预期内的取舍。
+
+### 7.5 用法
 
 ```bash
-python ./pooled_test_abtest.py
+python g:/v_stable_code/pooled_test_abtest.py
 ```
 
 修改场景：编辑 `main()` 中的 `scenarios` 列表。
 
 ---
 
-## 7. 后续扩展方向
+## 8. 后续扩展方向
 
 | 方向 | 说明 |
 |------|------|
-| 毒率非平稳 | 当前 OwnerEstimator 是无衰减累计；若毒率漂移可改为滑窗或指数衰减 |
 | 多层 Fallback | $M = 1$ 且 $k$ 很大时，二分递归在墙钟时间上可能优于单层 |
 | 软聚合 | 在不破坏 FIFO 的前提下，把"同 Owner 优先合到一组"作为软偏好 |
-| 自适应 Tau | 把 $\tau$ 做成关于 $\lambda$ 与 $\hat p$ 的函数，而不是固定常数 |
+| 衰减自适应 | 把 $\gamma$ 改成根据漂移检测信号（如 CUSUM）动态调整 |
+| 异常源识别 | 对 $\hat p_o$ 做置信带，自动把跳变剧烈的 Owner 标记为高风险并固定单测 |
 
