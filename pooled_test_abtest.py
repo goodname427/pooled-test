@@ -33,13 +33,22 @@ class Sample:
 @dataclass
 class Owner:
     oid: int
-    mu: float       # per-owner mean toxic rate
-    sigma: float    # per-owner std for sample-level p
+    mu_anchor: float    # long-term anchor toxic rate (fixed)
+    mu_current: float   # current-stage center, drifts via OU process
+    sigma: float        # per-owner std for sample-level p (short-term jitter)
+    kappa: float        # mean-reversion strength for stage transitions
+    drift_sigma: float  # std of stage-transition jump
+    next_switch_idx: int = 0  # sample index at which next stage switch occurs
 
     def sample_p(self, rng: random.Random) -> float:
         # truncated normal in [0.001, 0.99]
-        p = rng.gauss(self.mu, self.sigma)
+        p = rng.gauss(self.mu_current, self.sigma)
         return max(0.001, min(0.99, p))
+
+    def advance_stage(self, rng: random.Random):
+        """OU-style mean-reverting jump: pull toward anchor + symmetric noise."""
+        delta = self.kappa * (self.mu_anchor - self.mu_current) + rng.gauss(0.0, self.drift_sigma)
+        self.mu_current = max(0.001, min(0.999, self.mu_current + delta))
 
 
 def make_owners(
@@ -48,15 +57,20 @@ def make_owners(
     pop_sigma: float,
     owner_sigma: float,
     seed: int = 0,
+    kappa: float = 0.3,
+    drift_sigma: float = 0.02,
 ) -> List[Owner]:
-    """Create owners. Each owner has mu drawn from N(pop_mu, pop_sigma)
-    and a fixed within-owner sigma (variance of per-sample p)."""
+    """Create owners. Each owner has anchor mu drawn from N(pop_mu, pop_sigma).
+    mu_current starts at the anchor and drifts over time via an OU process."""
     rng = random.Random(seed)
     owners: List[Owner] = []
     for i in range(n_owners):
         mu = rng.gauss(pop_mu, pop_sigma)
         mu = max(0.005, min(0.5, mu))
-        owners.append(Owner(oid=i, mu=mu, sigma=owner_sigma))
+        owners.append(Owner(
+            oid=i, mu_anchor=mu, mu_current=mu,
+            sigma=owner_sigma, kappa=kappa, drift_sigma=drift_sigma,
+        ))
     return owners
 
 
@@ -65,15 +79,36 @@ def generate_samples_with_owners(
     arrival_rate: float,
     owners: List[Owner],
     seed: int = 0,
+    drift_rate: float = 50.0,
 ) -> List[Sample]:
-    """Poisson arrivals; each sample is randomly assigned to an owner;
-    its true_p ~ N(owner.mu, owner.sigma); its toxicity ~ Bernoulli(true_p)."""
+    """Poisson arrivals + OU drift on owner toxic rates.
+
+    Each owner has an independent stage-switch counter following a Poisson
+    process with mean ``drift_rate`` samples per stage. At each switch, the
+    owner's mu_current makes a mean-reverting jump toward its anchor.
+    Within a stage, per-sample p ~ N(mu_current, owner.sigma).
+    """
     rng = random.Random(seed)
+    drift_rng = random.Random(seed * 7919 + 13)
+
+    # initialise next-switch sample index per owner (geometric ~ Poisson process)
+    for o in owners:
+        gap = max(1, int(drift_rng.expovariate(1.0 / drift_rate)))
+        o.next_switch_idx = gap
+
+    # per-owner local sample counter (drives stage switches)
+    owner_local_count: Dict[int, int] = {o.oid: 0 for o in owners}
+
     samples: List[Sample] = []
     t = 0.0
     for i in range(n_samples):
         t += rng.expovariate(arrival_rate)
         owner = owners[rng.randrange(len(owners))]
+        owner_local_count[owner.oid] += 1
+        if owner_local_count[owner.oid] >= owner.next_switch_idx:
+            owner.advance_stage(drift_rng)
+            gap = max(1, int(drift_rng.expovariate(1.0 / drift_rate)))
+            owner.next_switch_idx = owner_local_count[owner.oid] + gap
         true_p = owner.sample_p(rng)
         toxic = 1 if rng.random() < true_p else 0
         samples.append(Sample(
@@ -124,38 +159,46 @@ class ReagentPool:
 # Owner-aware online estimator (Beta-Binomial / Laplace smoothing)
 # ---------------------------------------------------------------------------
 class OwnerEstimator:
-    """Per-owner toxic-rate estimator.
+    """Per-owner toxic-rate estimator with exponential decay.
 
-    Each owner keeps (toxic_count, total_count); p_hat = (k+1)/(n+2).
-    Cold start uses a global prior built from all resolved samples.
+    To track non-stationary (drifting) toxic rates, every observation is
+    weighted by ``decay`` (in (0, 1]); old observations fade exponentially.
+    Keeps (k_w, n_w) as decayed sums; p_hat = (k_w + 1) / (n_w + 2).
+    Cold start uses a global decayed prior.
+
+    decay = 1.0  -> no decay (pure cumulative posterior)
+    decay = 0.95 -> recent ~20 samples dominate
+    decay = 0.90 -> recent ~10 samples dominate
     """
 
-    def __init__(self, p_init: float = 0.1):
+    def __init__(self, p_init: float = 0.1, decay: float = 0.95):
         self.p_init = p_init
-        self.global_k = 0   # toxic count
-        self.global_n = 0
-        self.per_owner: Dict[int, Tuple[int, int]] = {}
+        self.decay = decay
+        self.global_k = 0.0
+        self.global_n = 0.0
+        self.per_owner: Dict[int, Tuple[float, float]] = {}
 
     def p_hat(self, owner_id: int) -> float:
         # owner-level posterior with global fallback
         if owner_id in self.per_owner:
             k, n = self.per_owner[owner_id]
-            if n >= 3:
+            if n >= 3.0:
                 return (k + 1.0) / (n + 2.0)
             # blend with global prior when owner has too few samples
             gk, gn = self.global_k, self.global_n
-            blended_k = k + (gk + 1.0) / (gn + 2.0) * 3
-            blended_n = n + 3
+            blended_k = k + (gk + 1.0) / (gn + 2.0) * 3.0
+            blended_n = n + 3.0
             return blended_k / (blended_n + 1.0)
         if self.global_n > 0:
             return (self.global_k + 1.0) / (self.global_n + 2.0)
         return self.p_init
 
     def update(self, owner_id: int, toxic: int):
-        k, n = self.per_owner.get(owner_id, (0, 0))
-        self.per_owner[owner_id] = (k + toxic, n + 1)
-        self.global_k += toxic
-        self.global_n += 1
+        k, n = self.per_owner.get(owner_id, (0.0, 0.0))
+        self.per_owner[owner_id] = (k * self.decay + toxic,
+                                    n * self.decay + 1.0)
+        self.global_k = self.global_k * self.decay + toxic
+        self.global_n = self.global_n * self.decay + 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +415,24 @@ def _expected_cost_per_sample(p_hats: List[float], T: float, M: int) -> Tuple[in
     return best_k, best_cost
 
 
+def _adaptive_tau(arrival_rate: float, p_hat: float, T: float,
+                  tau_min: float = 0.2, tau_max: float = 5.0) -> float:
+    """Adaptive tau heuristic.
+
+    Intuition:
+      - high arrival rate -> queue fills fast -> small tau is enough
+      - low p_hat         -> bigger groups pay off -> can wait longer
+      - high p_hat        -> singletons preferred -> small tau
+      - tau scales with T (so T=1 normalisation works for any T)
+
+    Formula:
+        tau = clip( (1 - p_hat) / max(arrival_rate, eps) * T, tau_min, tau_max )
+    """
+    eps = 1e-3
+    raw = (1.0 - p_hat) / max(arrival_rate, eps) * T
+    return max(tau_min, min(tau_max, raw))
+
+
 def run_eager_pooled(
     samples: List[Sample],
     M: int,
@@ -381,7 +442,11 @@ def run_eager_pooled(
     cold_start_n: int = 20,
     cold_start_max_group: int = 3,
     single_test_threshold: float = 0.35,
-    tau: float = 1.0,
+    tau: Optional[float] = None,
+    arrival_rate: Optional[float] = None,
+    decay: float = 0.95,
+    tau_min: float = 0.2,
+    tau_max: float = 5.0,
 ) -> Metrics:
     """Eager + Owner-aware + M-aware lookahead group sizing + 1-layer fallback.
 
@@ -401,7 +466,14 @@ def run_eager_pooled(
     arrival_idx = 0
     n_total = len(sorted_samples)
 
-    estimator = OwnerEstimator(p_init=p_init)
+    estimator = OwnerEstimator(p_init=p_init, decay=decay)
+
+    # if arrival_rate not provided, infer from sample stream
+    if arrival_rate is None and n_total >= 2:
+        span = sorted_samples[-1].arrival_time - sorted_samples[0].arrival_time
+        arrival_rate = (n_total - 1) / span if span > 0 else 1.0
+    elif arrival_rate is None:
+        arrival_rate = 1.0
 
     slots = [0.0] * M
     fresh_queue: List[Sample] = []
@@ -453,9 +525,16 @@ def run_eager_pooled(
 
         # tau soft-wait: if queue cannot reach the lookahead-optimal k yet,
         # and head waiting < tau, and more arrivals are still possible -> hold
+        # tau is adaptive (when not provided): scales inversely with arrival
+        # rate and head p_hat
+        if tau is None:
+            head_p = head_p_hats[0] if head_p_hats else p_init
+            cur_tau = _adaptive_tau(arrival_rate, head_p, T, tau_min, tau_max)
+        else:
+            cur_tau = tau
         head_wait = t_now - fresh_queue[0].arrival_time
         if (len(fresh_queue) < best_k
-                and head_wait < tau
+                and head_wait < cur_tau
                 and arrival_idx < n_total):
             return False
 
@@ -526,6 +605,10 @@ class Scenario:
     pop_mu: float = 0.1     # owners' mu ~ N(pop_mu, pop_sigma)
     pop_sigma: float = 0.05
     owner_sigma: float = 0.02  # within-owner per-sample p std
+    # OU drift params (non-stationary toxic rates)
+    drift_rate: float = 50.0   # avg samples per owner-stage
+    kappa: float = 0.3         # mean-reversion strength
+    drift_sigma: float = 0.02  # per-stage mu jump std
 
 
 def clone_samples(samples: List[Sample]) -> List[Sample]:
@@ -537,12 +620,19 @@ def clone_samples(samples: List[Sample]) -> List[Sample]:
 
 def run_scenario(sc: Scenario) -> Tuple[Metrics, Metrics, Metrics]:
     owners = make_owners(sc.n_owners, sc.pop_mu, sc.pop_sigma, sc.owner_sigma,
-                         seed=sc.seed * 1009 + 7)
+                         seed=sc.seed * 1009 + 7,
+                         kappa=sc.kappa, drift_sigma=sc.drift_sigma)
     samples = generate_samples_with_owners(sc.n_samples, sc.arrival_rate,
-                                           owners, seed=sc.seed)
+                                           owners, seed=sc.seed,
+                                           drift_rate=sc.drift_rate)
     base = run_baseline(clone_samples(samples), sc.M, sc.T)
     adaptive = run_adaptive_pooled(clone_samples(samples), sc.M, sc.T, sc.tau)
-    eager = run_eager_pooled(clone_samples(samples), sc.M, sc.T, tau=sc.tau)
+    # Eager: tau=None -> adaptive; pass arrival_rate so the estimator can
+    # compute a reasonable wait window before history is accumulated.
+    eager = run_eager_pooled(
+        clone_samples(samples), sc.M, sc.T,
+        tau=None, arrival_rate=sc.arrival_rate,
+    )
     return base, adaptive, eager
 
 
@@ -614,6 +704,17 @@ def main():
                  n_owners=10, pop_mu=0.10, pop_sigma=0.06, owner_sigma=0.02, seed=9),
         Scenario("sparse_hetero",     n_samples=200, arrival_rate=0.3, M=2, T=1.0, tau=3.0,
                  n_owners=10, pop_mu=0.10, pop_sigma=0.06, owner_sigma=0.02, seed=10),
+
+        # ---- non-stationary toxic rates (OU drift) ----
+        Scenario("drift_slow",        n_samples=600, arrival_rate=2.0, M=2, T=1.0, tau=2.0,
+                 n_owners=10, pop_mu=0.10, pop_sigma=0.05, owner_sigma=0.01,
+                 drift_rate=80.0, kappa=0.3, drift_sigma=0.02, seed=11),
+        Scenario("drift_fast",        n_samples=600, arrival_rate=2.0, M=2, T=1.0, tau=2.0,
+                 n_owners=10, pop_mu=0.10, pop_sigma=0.05, owner_sigma=0.01,
+                 drift_rate=20.0, kappa=0.3, drift_sigma=0.04, seed=12),
+        Scenario("drift_volatile",    n_samples=600, arrival_rate=2.0, M=2, T=1.0, tau=2.0,
+                 n_owners=8,  pop_mu=0.12, pop_sigma=0.06, owner_sigma=0.015,
+                 drift_rate=15.0, kappa=0.2, drift_sigma=0.06, seed=13),
     ]
 
     summary: List[Tuple[str, Metrics, Metrics, Metrics]] = []
